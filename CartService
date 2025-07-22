@@ -1,0 +1,213 @@
+// ProductService.java
+@Service
+@Transactional
+@Slf4j
+public class ProductService {
+    
+    @Autowired
+    private ProductRepository productRepository;
+    
+    @Autowired
+    private CategoryRepository categoryRepository;
+    
+    public Page<Product> findProducts(ProductSearchCriteria criteria, Pageable pageable) {
+        log.info("Searching products with criteria: {}", criteria);
+        
+        return productRepository.findAll(
+            ProductSpecification.withCriteria(criteria), 
+            pageable
+        );
+    }
+    
+    public ProductDto createProduct(CreateProductRequest request) {
+        log.info("Creating new product: {}", request.getName());
+        
+        // Validate category exists
+        Category category = categoryRepository.findById(request.getCategoryId())
+            .orElseThrow(() -> new CategoryNotFoundException("Category not found"));
+        
+        Product product = Product.builder()
+            .name(request.getName())
+            .description(request.getDescription())
+            .price(request.getPrice())
+            .stockQuantity(request.getStockQuantity())
+            .category(category)
+            .imageUrls(request.getImageUrls())
+            .active(true)
+            .build();
+        
+        Product savedProduct = productRepository.save(product);
+        return mapToDto(savedProduct);
+    }
+    
+    public ProductDto updateStock(Long productId, Integer newStock) {
+        log.info("Updating stock for product {} to {}", productId, newStock);
+        
+        Product product = productRepository.findById(productId)
+            .orElseThrow(() -> new ProductNotFoundException("Product not found"));
+        
+        if (newStock < 0) {
+            throw new InvalidStockException("Stock quantity cannot be negative");
+        }
+        
+        product.setStockQuantity(newStock);
+        Product savedProduct = productRepository.save(product);
+        
+        // Send low stock alert if needed
+        if (newStock <= 10) {
+            sendLowStockAlert(product);
+        }
+        
+        return mapToDto(savedProduct);
+    }
+    
+    private void sendLowStockAlert(Product product) {
+        // Implementation for sending alert to admin
+        log.warn("Low stock alert for product: {} (Stock: {})", 
+                product.getName(), product.getStockQuantity());
+    }
+    
+    private ProductDto mapToDto(Product product) {
+        return ProductDto.builder()
+            .id(product.getId())
+            .name(product.getName())
+            .description(product.getDescription())
+            .price(product.getPrice())
+            .stockQuantity(product.getStockQuantity())
+            .categoryName(product.getCategory().getName())
+            .imageUrls(product.getImageUrls())
+            .averageRating(product.getAverageRating())
+            .active(product.getActive())
+            .build();
+    }
+}
+
+// CartService.java
+@Service
+@Transactional
+@Slf4j
+public class CartService {
+    
+    @Autowired
+    private CartRepository cartRepository;
+    
+    @Autowired
+    private ProductRepository productRepository;
+    
+    @Autowired
+    private UserRepository userRepository;
+    
+    public CartDto addToCart(Long userId, AddToCartRequest request) {
+        log.info("Adding item to cart for user {}: productId={}, quantity={}", 
+                userId, request.getProductId(), request.getQuantity());
+        
+        User user = userRepository.findById(userId)
+            .orElseThrow(() -> new UserNotFoundException("User not found"));
+        
+        Product product = productRepository.findById(request.getProductId())
+            .orElseThrow(() -> new ProductNotFoundException("Product not found"));
+        
+        // Check stock availability
+        if (product.getStockQuantity() < request.getQuantity()) {
+            throw new InsufficientStockException("Not enough stock available");
+        }
+        
+        Cart cart = findOrCreateCart(user);
+        
+        // Check if item already exists in cart
+        Optional<CartItem> existingItem = cart.getItems().stream()
+            .filter(item -> item.getProduct().getId().equals(request.getProductId()))
+            .findFirst();
+        
+        if (existingItem.isPresent()) {
+            // Update quantity
+            CartItem item = existingItem.get();
+            int newQuantity = item.getQuantity() + request.getQuantity();
+            
+            if (product.getStockQuantity() < newQuantity) {
+                throw new InsufficientStockException("Not enough stock available");
+            }
+            
+            item.setQuantity(newQuantity);
+        } else {
+            // Add new item
+            CartItem newItem = CartItem.builder()
+                .cart(cart)
+                .product(product)
+                .quantity(request.getQuantity())
+                .unitPrice(product.getPrice())
+                .build();
+            
+            cart.getItems().add(newItem);
+        }
+        
+        Cart savedCart = cartRepository.save(cart);
+        return mapToDto(savedCart);
+    }
+    
+    public CartDto removeFromCart(Long userId, Long productId) {
+        log.info("Removing item from cart: userId={}, productId={}", userId, productId);
+        
+        Cart cart = findCartByUserId(userId);
+        
+        cart.getItems().removeIf(item -> item.getProduct().getId().equals(productId));
+        
+        Cart savedCart = cartRepository.save(cart);
+        return mapToDto(savedCart);
+    }
+    
+    public CartDto getCart(Long userId) {
+        Cart cart = findCartByUserId(userId);
+        return mapToDto(cart);
+    }
+    
+    public void clearCart(Long userId) {
+        log.info("Clearing cart for user: {}", userId);
+        Cart cart = findCartByUserId(userId);
+        cart.getItems().clear();
+        cartRepository.save(cart);
+    }
+    
+    private Cart findOrCreateCart(User user) {
+        return cartRepository.findByUserId(user.getId())
+            .orElseGet(() -> {
+                Cart newCart = Cart.builder()
+                    .user(user)
+                    .items(new ArrayList<>())
+                    .build();
+                return cartRepository.save(newCart);
+            });
+    }
+    
+    private Cart findCartByUserId(Long userId) {
+        return cartRepository.findByUserId(userId)
+            .orElseThrow(() -> new CartNotFoundException("Cart not found for user"));
+    }
+    
+    private CartDto mapToDto(Cart cart) {
+        List<CartItemDto> itemDtos = cart.getItems().stream()
+            .map(this::mapItemToDto)
+            .collect(Collectors.toList());
+        
+        return CartDto.builder()
+            .id(cart.getId())
+            .items(itemDtos)
+            .totalAmount(cart.getTotalAmount())
+            .totalItems(cart.getTotalItems())
+            .updatedAt(cart.getUpdatedAt())
+            .build();
+    }
+    
+    private CartItemDto mapItemToDto(CartItem item) {
+        return CartItemDto.builder()
+            .id(item.getId())
+            .productId(item.getProduct().getId())
+            .productName(item.getProduct().getName())
+            .unitPrice(item.getUnitPrice())
+            .quantity(item.getQuantity())
+            .totalPrice(item.getTotalPrice())
+            .imageUrl(item.getProduct().getImageUrls().isEmpty() ? 
+                     null : item.getProduct().getImageUrls().get(0))
+            .build();
+    }
+}
